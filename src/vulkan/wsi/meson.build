@@ -2,6 +2,11 @@
 # SPDX-License-Identifier: MIT
 
 files_vulkan_wsi = files('wsi_common.c')
+
+# Internal Kolos transport/import core; no surface/swapchain dispatch hook yet.
+if host_machine.system() == 'linux'
+  files_vulkan_wsi += files('wsi_common_kolos.c')
+endif
 links_vulkan_wsi = []
 platform_deps = []
 
@@ -56,7 +61,7 @@ libvulkan_wsi = static_library(
   [files_vulkan_wsi, wsi_entrypoints],
   include_directories : [inc_include, inc_src],
   dependencies : [
-    vulkan_wsi_deps, dep_libdrm, dep_libudev, idep_vulkan_util_headers,
+    vulkan_wsi_deps, dep_libdrm, dep_libudev, dep_thread, idep_vulkan_util_headers,
     idep_vulkan_runtime_headers, idep_xmlconfig, idep_mesautil, platform_deps,
     idep_blake3
   ],
