@@ -3,9 +3,9 @@
 
 files_vulkan_wsi = files('wsi_common.c')
 
-# Internal Kolos transport/import core; no surface/swapchain dispatch hook yet.
+# Internal Kolos import core; transport and surface dispatch are provided later.
 if host_machine.system() == 'linux'
-  files_vulkan_wsi += files('wsi_common_kolos.c')
+  files_vulkan_wsi += files('wsi_common_kolos.c', 'wsi_common_kolos_qualcomm.c')
 endif
 links_vulkan_wsi = []
 platform_deps = []
