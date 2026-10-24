@@ -185,6 +185,10 @@ struct wsi_swapchain {
    struct wsi_image_info image_info;
    uint32_t image_count;
 
+   /* Platform handoff uses the common present submission's CPU fence rather
+    * than dma-buf implicit/explicit sync signaling. */
+   bool cpu_wait_for_present;
+
    uint64_t present_serial;
 
    struct {

@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Kolos private Wayland protocol v1. Canonical source:
+     KolosLinux/protocol/kolos-graphics-v1.xml. Keep definitions in sync. -->
+<protocol name="kolos_graphics_v1">
+  <interface name="kolos_graphics_v1" version="1">
+    <description summary="Kolos graphics transport for a Wayland surface">
+      Only the compositor maps a wl_surface to an Android session. The client
+      never supplies a session id. All 64-bit values are high/low uint pairs.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_surface">
+      <arg name="id" type="new_id" interface="kolos_surface_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+  <interface name="kolos_surface_v1" version="1">
+    <description summary="graphics pool attached to one xdg_toplevel">
+      BUFFER FDs are borrowed dma-buf/native-handle FDs. The native-handle
+      byte array is the observed Android handle data; clients must validate
+      layout before import. FREE alone permits reuse after Android release.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="request_buffer">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="slot" type="uint"/>
+    </request>
+    <request name="pool_ready">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+    </request>
+    <request name="present">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="slot" type="uint"/>
+      <arg name="serial_hi" type="uint"/>
+      <arg name="serial_lo" type="uint"/>
+    </request>
+    <event name="new_pool">
+      <arg name="session_hi" type="uint"/>
+      <arg name="session_lo" type="uint"/>
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="format" type="uint"/>
+      <arg name="slot_count" type="uint"/>
+    </event>
+    <event name="pool_replaced">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="format" type="uint"/>
+      <arg name="slot_count" type="uint"/>
+    </event>
+    <event name="buffer">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="slot" type="uint"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+      <arg name="format" type="uint"/>
+      <arg name="stride" type="uint"/>
+      <arg name="native_handle" type="array"/>
+      <arg name="pixel_fd" type="fd"/>
+      <arg name="metadata_fd" type="fd"/>
+    </event>
+    <event name="free">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="slot" type="uint"/>
+    </event>
+    <event name="ack">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="slot" type="uint"/>
+      <arg name="serial_hi" type="uint"/>
+      <arg name="serial_lo" type="uint"/>
+    </event>
+    <event name="error">
+      <arg name="message" type="string"/>
+    </event>
+  </interface>
+</protocol>

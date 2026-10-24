@@ -199,6 +199,8 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(GetImageSubresourceLayout);
    if (!wsi->sw)
       WSI_GET_CB(GetMemoryFdKHR);
+   if (!wsi->sw)
+      WSI_GET_CB(GetMemoryFdPropertiesKHR);
    WSI_GET_CB(GetPhysicalDeviceFormatProperties);
    WSI_GET_CB(GetPhysicalDeviceFormatProperties2);
    WSI_GET_CB(GetPhysicalDeviceImageFormatProperties2);
@@ -1503,7 +1505,7 @@ wsi_common_queue_present(const struct wsi_device *wsi,
          submit_info.signalSemaphoreCount = 1;
          submit_info.pSignalSemaphores = &image->explicit_sync[WSI_ES_ACQUIRE].semaphore;
          __vk_append_struct(&submit_info, &timeline_submit_info);
-      } else {
+      } else if (!swapchain->cpu_wait_for_present) {
 #ifdef HAVE_LIBDRM
          result = wsi_prepare_signal_dma_buf_from_semaphore(swapchain, image);
          if (result == VK_SUCCESS) {
@@ -1555,9 +1557,13 @@ wsi_common_queue_present(const struct wsi_device *wsi,
 #endif
       }
 
-      if (wsi->sw)
-	      wsi->WaitForFences(device, 1, &swapchain->fences[image_index],
-				 true, ~0ull);
+      if (wsi->sw || swapchain->cpu_wait_for_present) {
+         result = wsi->WaitForFences(device, 1,
+                                     &swapchain->fences[image_index],
+                                     true, ~0ull);
+         if (result != VK_SUCCESS)
+            goto fail_present;
+      }
 
       const VkPresentRegionKHR *region = NULL;
       if (regions && regions->pRegions)

@@ -264,6 +264,7 @@ struct wsi_device {
    WSI_CB(GetImageMemoryRequirements);
    WSI_CB(GetImageSubresourceLayout);
    WSI_CB(GetMemoryFdKHR);
+   WSI_CB(GetMemoryFdPropertiesKHR);
    WSI_CB(GetPhysicalDeviceFormatProperties);
    WSI_CB(GetPhysicalDeviceFormatProperties2);
    WSI_CB(GetPhysicalDeviceImageFormatProperties2);

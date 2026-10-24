@@ -3,7 +3,7 @@
 
 files_vulkan_wsi = files('wsi_common.c')
 
-# Internal Kolos import core; transport and surface dispatch are provided later.
+# Internal Kolos import core; Wayland transport is built below.
 if host_machine.system() == 'linux'
   files_vulkan_wsi += files('wsi_common_kolos.c', 'wsi_common_kolos_qualcomm.c')
 endif
@@ -20,6 +20,17 @@ endif
 
 if with_platform_wayland
   files_vulkan_wsi += files('wsi_common_wayland.c')
+  kolos_protocol = files('protocol/kolos-graphics-v1.xml')
+  files_vulkan_wsi += custom_target('kolos-graphics-v1-client-header',
+    input : kolos_protocol,
+    output : 'kolos-graphics-v1-client-protocol.h',
+    command : [prog_wl_scanner, 'client-header', '@INPUT@', '@OUTPUT@'],
+  )
+  files_vulkan_wsi += custom_target('kolos-graphics-v1-client-code',
+    input : kolos_protocol,
+    output : 'kolos-graphics-v1-protocol.c',
+    command : [prog_wl_scanner, wl_scanner_arg, '@INPUT@', '@OUTPUT@'],
+  )
   files_vulkan_wsi += wp_files['fifo-v1']
   files_vulkan_wsi += wp_files['commit-timing-v1']
   files_vulkan_wsi += wp_files['linux-dmabuf-unstable-v1']

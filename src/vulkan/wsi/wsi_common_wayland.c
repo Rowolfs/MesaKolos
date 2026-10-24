@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <string.h>
 #include <poll.h>
 #include <sys/mman.h>
@@ -41,6 +42,9 @@
 #include "vk_util.h"
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
+#include "wsi_common_kolos.h"
+#include "wsi_common_kolos_qualcomm.h"
+#include "kolos-graphics-v1-client-protocol.h"
 #include "fifo-v1-client-protocol.h"
 #include "commit-timing-v1-client-protocol.h"
 #include "linux-dmabuf-unstable-v1-client-protocol.h"
@@ -68,6 +72,7 @@
 #endif
 
 struct wsi_wayland;
+struct wsi_wl_kolos_swapchain;
 
 struct wsi_wl_format {
    VkFormat vk_format;
@@ -103,6 +108,7 @@ struct wsi_wl_display {
    /* Actually a proxy wrapper around the event queue */
    struct wl_display *wl_display_wrapper;
    struct wl_event_queue *queue;
+   struct kolos_graphics_v1 *kolos_graphics;
 
    struct wl_shm *wl_shm;
    struct zwp_linux_dmabuf_v1 *wl_dmabuf;
@@ -180,6 +186,16 @@ struct wsi_wl_surface {
    struct dmabuf_feedback dmabuf_feedback, pending_dmabuf_feedback;
 
    struct wp_linux_drm_syncobj_surface_v1 *wl_syncobj_surface;
+   struct kolos_surface_v1 *kolos_surface;
+   struct wsi_kolos_session *kolos_session;
+   struct wsi_kolos_pool *kolos_staging;
+   struct wsi_kolos_pool_info kolos_info;
+   VkDevice kolos_device;
+   uint32_t kolos_imported;
+   VkResult kolos_error;
+   VkImageUsageFlags kolos_usage;
+   uint64_t kolos_next_serial;
+   struct wsi_wl_kolos_swapchain *kolos_chain;
 };
 
 struct wsi_wl_swapchain {
@@ -234,6 +250,14 @@ struct wsi_wl_swapchain {
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_wl_swapchain, base.base, VkSwapchainKHR,
                                VK_OBJECT_TYPE_SWAPCHAIN_KHR)
+
+static VkResult wsi_wl_surface_init(struct wsi_wl_surface *surface,
+                                    struct wsi_device *wsi_device,
+                                    const VkAllocationCallbacks *alloc);
+static VkResult kolos_wait_for_info(struct wsi_wl_surface *surface);
+static VkResult wsi_wl_check_kolos(VkIcdSurfaceBase *icd_surface,
+                                   struct wsi_device *wsi_device,
+                                   bool *is_kolos);
 
 static bool
 wsi_wl_use_explicit_sync(struct wsi_wl_display *display, struct wsi_device *device)
@@ -903,6 +927,11 @@ registry_handle_global(void *data, struct wl_registry *registry,
 {
    struct wsi_wl_display *display = data;
 
+   if (strcmp(interface, kolos_graphics_v1_interface.name) == 0 &&
+       !display->kolos_graphics)
+      display->kolos_graphics = wl_registry_bind(registry, name,
+                                                 &kolos_graphics_v1_interface, 1);
+
    if (display->sw) {
       if (strcmp(interface, wl_shm_interface.name) == 0) {
          display->wl_shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
@@ -957,6 +986,8 @@ static const struct wl_registry_listener registry_listener = {
 static void
 wsi_wl_display_finish(struct wsi_wl_display *display)
 {
+   if (display->kolos_graphics)
+      kolos_graphics_v1_destroy(display->kolos_graphics);
    struct wsi_wl_format *f;
    u_vector_foreach(f, &display->formats)
       u_vector_finish(&f->modifiers);
@@ -1027,7 +1058,8 @@ wsi_wl_display_init(struct wsi_wayland *wsi_wl,
 
    /* Round-trip to get wl_shm and zwp_linux_dmabuf_v1 globals */
    wl_display_roundtrip_queue(display->wl_display, display->queue);
-   if (!display->wl_dmabuf && !display->wl_shm) {
+   if (!display->wl_dmabuf && !display->wl_shm &&
+       !display->kolos_graphics) {
       result = VK_ERROR_SURFACE_LOST_KHR;
       goto fail_registry;
    }
@@ -1164,8 +1196,12 @@ wsi_wl_surface_get_support(VkIcdSurfaceBase *surface,
                            uint32_t queueFamilyIndex,
                            VkBool32* pSupported)
 {
-   *pSupported = true;
-
+   bool is_kolos;
+   VkResult result = wsi_wl_check_kolos(surface, wsi_device, &is_kolos);
+   if (result != VK_SUCCESS)
+      return result;
+   *pSupported = !is_kolos || (!wsi_device->sw &&
+      (wsi_device->queue_supports_blit & BITFIELD64_BIT(queueFamilyIndex)));
    return VK_SUCCESS;
 }
 
@@ -1218,6 +1254,31 @@ wsi_wl_surface_get_capabilities(VkIcdSurfaceBase *icd_surface,
                                 const VkSurfacePresentModeEXT *present_mode,
                                 VkSurfaceCapabilitiesKHR* caps)
 {
+   bool is_kolos;
+   VkResult kolos_result = wsi_wl_check_kolos(icd_surface, wsi_device,
+                                               &is_kolos);
+   if (kolos_result != VK_SUCCESS)
+      return kolos_result;
+   if (is_kolos) {
+      struct wsi_wl_surface *ks = wl_container_of(
+         (VkIcdSurfaceWayland *)icd_surface, ks, base);
+      if (present_mode && present_mode->presentMode != VK_PRESENT_MODE_FIFO_KHR)
+         return VK_ERROR_INITIALIZATION_FAILED;
+      *caps = (VkSurfaceCapabilitiesKHR) {
+         .minImageCount = 2,
+         .maxImageCount = ks->kolos_info.slot_count,
+         .currentExtent = { ks->kolos_info.width, ks->kolos_info.height },
+         .minImageExtent = { ks->kolos_info.width, ks->kolos_info.height },
+         .maxImageExtent = { ks->kolos_info.width, ks->kolos_info.height },
+         .maxImageArrayLayers = 1,
+         .supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+         .currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR,
+         .supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
+         .supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+      };
+      return VK_SUCCESS;
+   }
    VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
    struct wsi_wl_surface *wsi_wl_surface =
       wl_container_of((VkIcdSurfaceWayland *)icd_surface, wsi_wl_surface, base);
@@ -1277,6 +1338,11 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
    VkResult result =
       wsi_wl_surface_get_capabilities(surface, wsi_device, present_mode,
                                       &caps->surfaceCapabilities);
+   if (result != VK_SUCCESS)
+      return result;
+   struct wsi_wl_surface *wl_surface =
+      wl_container_of((VkIcdSurfaceWayland *)surface, wl_surface, base);
+   bool is_kolos = wl_surface->kolos_surface != NULL;
 
    vk_foreach_struct(ext, caps->pNext) {
       switch (ext->sType) {
@@ -1298,6 +1364,13 @@ wsi_wl_surface_get_capabilities2(VkIcdSurfaceBase *surface,
       }
 
       case VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_EXT: {
+         if (is_kolos) {
+            VkSurfacePresentModeCompatibilityEXT *compat = (void *)ext;
+            if (compat->pPresentModes && compat->presentModeCount)
+               compat->pPresentModes[0] = VK_PRESENT_MODE_FIFO_KHR;
+            compat->presentModeCount = 1;
+            break;
+         }
          /* Can easily toggle between FIFO and MAILBOX on Wayland. */
          VkSurfacePresentModeCompatibilityEXT *compat = (void *)ext;
          if (compat->pPresentModes) {
@@ -1357,6 +1430,19 @@ wsi_wl_surface_get_formats(VkIcdSurfaceBase *icd_surface,
                            uint32_t* pSurfaceFormatCount,
                            VkSurfaceFormatKHR* pSurfaceFormats)
 {
+   bool is_kolos;
+   VkResult result = wsi_wl_check_kolos(icd_surface, wsi_device, &is_kolos);
+   if (result != VK_SUCCESS)
+      return result;
+   if (is_kolos) {
+      VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out,
+                             pSurfaceFormats, pSurfaceFormatCount);
+      vk_outarray_append_typed(VkSurfaceFormatKHR, &out, fmt) {
+         fmt->format = VK_FORMAT_R8G8B8A8_UNORM;
+         fmt->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      }
+      return vk_outarray_status(&out);
+   }
    VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
    struct wsi_wayland *wsi =
       (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
@@ -1396,6 +1482,19 @@ wsi_wl_surface_get_formats2(VkIcdSurfaceBase *icd_surface,
                             uint32_t* pSurfaceFormatCount,
                             VkSurfaceFormat2KHR* pSurfaceFormats)
 {
+   bool is_kolos;
+   VkResult result = wsi_wl_check_kolos(icd_surface, wsi_device, &is_kolos);
+   if (result != VK_SUCCESS)
+      return result;
+   if (is_kolos) {
+      VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormat2KHR, out,
+                             pSurfaceFormats, pSurfaceFormatCount);
+      vk_outarray_append_typed(VkSurfaceFormat2KHR, &out, fmt) {
+         fmt->surfaceFormat.format = VK_FORMAT_R8G8B8A8_UNORM;
+         fmt->surfaceFormat.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      }
+      return vk_outarray_status(&out);
+   }
    VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
    struct wsi_wayland *wsi =
       (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
@@ -1434,6 +1533,21 @@ wsi_wl_surface_get_present_modes(VkIcdSurfaceBase *icd_surface,
                                  uint32_t* pPresentModeCount,
                                  VkPresentModeKHR* pPresentModes)
 {
+   bool is_kolos;
+   VkResult result = wsi_wl_check_kolos(icd_surface, wsi_device, &is_kolos);
+   if (result != VK_SUCCESS)
+      return result;
+   if (is_kolos) {
+      if (!pPresentModes) {
+         *pPresentModeCount = 1;
+         return VK_SUCCESS;
+      }
+      uint32_t count = *pPresentModeCount;
+      *pPresentModeCount = MIN2(count, 1);
+      if (count)
+         pPresentModes[0] = VK_PRESENT_MODE_FIFO_KHR;
+      return count ? VK_SUCCESS : VK_INCOMPLETE;
+   }
    VkIcdSurfaceWayland *surface = (VkIcdSurfaceWayland *)icd_surface;
    struct wsi_wayland *wsi =
       (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
@@ -1498,6 +1612,241 @@ wsi_wl_surface_analytics_fini(struct wsi_wl_surface *wsi_wl_surface,
             wsi_wl_surface->analytics.latency_str);
 }
 
+static uint64_t
+kolos_join(uint32_t hi, uint32_t lo)
+{
+   return ((uint64_t)hi << 32) | lo;
+}
+
+static VkResult
+kolos_request_buffer(void *data, struct wsi_kolos_identity id)
+{
+   struct wsi_wl_surface *surface = data;
+   kolos_surface_v1_request_buffer(surface->kolos_surface,
+                                   id.generation >> 32, id.generation,
+                                   id.slot);
+   return VK_SUCCESS;
+}
+
+static VkResult
+kolos_pool_ready(void *data, uint64_t session_id, uint64_t generation)
+{
+   struct wsi_wl_surface *surface = data;
+   kolos_surface_v1_pool_ready(surface->kolos_surface,
+                               generation >> 32, generation);
+   return VK_SUCCESS;
+}
+
+static VkResult
+kolos_present(void *data, struct wsi_kolos_identity id, uint64_t serial)
+{
+   struct wsi_wl_surface *surface = data;
+   kolos_surface_v1_present(surface->kolos_surface,
+                            id.generation >> 32, id.generation, id.slot,
+                            serial >> 32, serial);
+   return VK_SUCCESS;
+}
+
+static const struct wsi_kolos_transport_ops kolos_transport = {
+   .request_buffer = kolos_request_buffer,
+   .pool_ready = kolos_pool_ready,
+   .present = kolos_present,
+};
+static VkResult
+wsi_wl_check_kolos(VkIcdSurfaceBase *icd_surface,
+                   struct wsi_device *wsi_device, bool *is_kolos)
+{
+   struct wsi_wl_surface *surface =
+      wl_container_of((VkIcdSurfaceWayland *)icd_surface, surface, base);
+   struct wsi_wayland *wsi =
+      (struct wsi_wayland *)wsi_device->wsi[VK_ICD_WSI_PLATFORM_WAYLAND];
+   VkResult result = wsi_wl_surface_init(surface, wsi_device, wsi->alloc);
+   if (result != VK_SUCCESS)
+      return result;
+   *is_kolos = surface->kolos_surface != NULL;
+   return *is_kolos ? kolos_wait_for_info(surface) : VK_SUCCESS;
+}
+
+static void
+kolos_fail(struct wsi_wl_surface *surface, VkResult error)
+{
+   if (surface->kolos_error == VK_SUCCESS)
+      surface->kolos_error = error;
+   if (surface->kolos_session)
+      wsi_kolos_session_error(surface->kolos_session, error);
+}
+
+static void
+kolos_begin_pool(struct wsi_wl_surface *surface, uint64_t session_id,
+                 uint64_t generation, uint32_t width, uint32_t height,
+                 uint32_t format, uint32_t slots)
+{
+   if (!session_id || !generation || !width || !height ||
+       format != 1 || slots < 2 || slots > 16 ||
+       (surface->kolos_info.generation &&
+        generation <= surface->kolos_info.generation) ||
+       (surface->kolos_info.session_id &&
+        session_id != surface->kolos_info.session_id)) {
+      kolos_fail(surface, VK_ERROR_INITIALIZATION_FAILED);
+      return;
+   }
+   surface->kolos_info = (struct wsi_kolos_pool_info) {
+      .session_id = session_id, .generation = generation,
+      .width = width, .height = height, .format = format,
+      .slot_count = slots,
+   };
+   fprintf(stderr, "MesaKolos: session=%" PRIu64 " generation=%" PRIu64
+           " size=%ux%u slots=%u\n", session_id, generation,
+           width, height, slots);
+   if (!surface->kolos_session)
+      return;
+   if (surface->kolos_staging) {
+      wsi_kolos_pool_destroy(surface->kolos_staging);
+      surface->kolos_staging = NULL;
+   }
+   surface->kolos_imported = 0;
+   VkResult result = wsi_kolos_pool_create(surface->kolos_session,
+                                            generation, width, height,
+                                            format, slots,
+                                            &surface->kolos_staging);
+   if (result == VK_SUCCESS)
+      result = wsi_kolos_pool_request_buffers(surface->kolos_staging);
+   if (result != VK_SUCCESS)
+      kolos_fail(surface, result);
+}
+
+static void
+kolos_new_pool(void *data, struct kolos_surface_v1 *proxy,
+               uint32_t session_hi, uint32_t session_lo,
+               uint32_t generation_hi, uint32_t generation_lo,
+               uint32_t width, uint32_t height, uint32_t format,
+               uint32_t slots)
+{
+   struct wsi_wl_surface *surface = data;
+   kolos_begin_pool(surface, kolos_join(session_hi, session_lo),
+                    kolos_join(generation_hi, generation_lo),
+                    width, height, format, slots);
+}
+
+static void
+kolos_pool_replaced(void *data, struct kolos_surface_v1 *proxy,
+                    uint32_t generation_hi, uint32_t generation_lo,
+                    uint32_t width, uint32_t height, uint32_t format,
+                    uint32_t slots)
+{
+   struct wsi_wl_surface *surface = data;
+   kolos_begin_pool(surface, surface->kolos_info.session_id,
+                    kolos_join(generation_hi, generation_lo),
+                    width, height, format, slots);
+}
+
+static void
+kolos_buffer(void *data, struct kolos_surface_v1 *proxy,
+             uint32_t generation_hi, uint32_t generation_lo, uint32_t slot,
+             uint32_t width, uint32_t height, uint32_t format,
+             uint32_t stride, struct wl_array *handle,
+             int32_t pixel_fd, int32_t metadata_fd)
+{
+   struct wsi_wl_surface *surface = data;
+   uint64_t generation = kolos_join(generation_hi, generation_lo);
+   if (surface->kolos_error == VK_SUCCESS && surface->kolos_staging &&
+       generation == surface->kolos_info.generation) {
+      struct wsi_kolos_buffer_desc desc = {
+         .id = { surface->kolos_info.session_id, generation, slot },
+         .width = width, .height = height, .format = format,
+         .stride = stride,
+      };
+      int fds[2] = { pixel_fd, metadata_fd };
+      VkResult result = wsi_kolos_qualcomm_linear_from_handle(
+         handle->data, handle->size, fds, 2, &desc);
+      if (result == VK_SUCCESS)
+         result = wsi_kolos_import_buffer(surface->kolos_staging, &desc);
+      if (result == VK_SUCCESS && ++surface->kolos_imported ==
+          surface->kolos_info.slot_count) {
+         result = wsi_kolos_pool_notify_ready(surface->kolos_staging);
+         if (result == VK_SUCCESS)
+            result = wsi_kolos_pool_activate(surface->kolos_staging);
+         if (result == VK_SUCCESS)
+            surface->kolos_staging = NULL;
+         if (result == VK_SUCCESS)
+            fprintf(stderr, "MesaKolos: generation=%" PRIu64
+                    " imported %u AHB images\n", generation,
+                    surface->kolos_imported);
+      }
+      if (result != VK_SUCCESS)
+         kolos_fail(surface, result);
+   }
+   close(pixel_fd);
+   close(metadata_fd);
+}
+
+static void
+kolos_free(void *data, struct kolos_surface_v1 *proxy,
+           uint32_t generation_hi, uint32_t generation_lo, uint32_t slot)
+{
+   struct wsi_wl_surface *surface = data;
+   if (surface->kolos_session) {
+      struct wsi_kolos_identity id = {
+         surface->kolos_info.session_id,
+         kolos_join(generation_hi, generation_lo), slot,
+      };
+      /* A retired generation may already have been collected. */
+      wsi_kolos_pool_set_available(surface->kolos_session, id);
+   }
+}
+
+static void
+kolos_ack(void *data, struct kolos_surface_v1 *proxy,
+          uint32_t generation_hi, uint32_t generation_lo, uint32_t slot,
+          uint32_t serial_hi, uint32_t serial_lo)
+{
+   /* ACK confirms acceptance, not Android release.  Only FREE reopens slot. */
+}
+
+static void
+kolos_error(void *data, struct kolos_surface_v1 *proxy,
+            const char *message)
+{
+   fprintf(stderr, "MesaKolos: compositor graphics error: %s\n",
+           message ? message : "unknown");
+   kolos_fail(data, VK_ERROR_INITIALIZATION_FAILED);
+}
+
+static const struct kolos_surface_v1_listener kolos_listener = {
+   kolos_new_pool, kolos_pool_replaced, kolos_buffer,
+   kolos_free, kolos_ack, kolos_error,
+};
+
+static VkResult
+kolos_wait_for_info(struct wsi_wl_surface *surface)
+{
+   if (surface->kolos_info.generation &&
+       wl_display_roundtrip_queue(surface->display->wl_display,
+                                  surface->display->queue) < 0)
+      return VK_ERROR_SURFACE_LOST_KHR;
+   if (wl_display_dispatch_queue_pending(surface->display->wl_display,
+                                         surface->display->queue) < 0)
+      return VK_ERROR_SURFACE_LOST_KHR;
+   struct timespec now, duration = { .tv_sec = 15 };
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   struct timespec deadline;
+   timespec_add(&deadline, &duration, &now);
+   while (!surface->kolos_info.generation &&
+          surface->kolos_error == VK_SUCCESS) {
+      if (wl_display_flush(surface->display->wl_display) < 0 &&
+          errno != EAGAIN)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      int dispatched = loader_wayland_dispatch(surface->display->wl_display,
+                                                surface->display->queue,
+                                                &deadline);
+      if (dispatched < 0)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      if (dispatched == 0)
+         return VK_ERROR_INITIALIZATION_FAILED;
+   }
+   return surface->kolos_error;
+}
+
 void
 wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
                        const VkAllocationCallbacks *pAllocator)
@@ -1505,6 +1854,11 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
    VK_FROM_HANDLE(vk_instance, instance, _instance);
    struct wsi_wl_surface *wsi_wl_surface =
       wl_container_of((VkIcdSurfaceWayland *)icd_surface, wsi_wl_surface, base);
+
+   if (wsi_wl_surface->kolos_surface)
+      kolos_surface_v1_destroy(wsi_wl_surface->kolos_surface);
+   if (wsi_wl_surface->kolos_session)
+      wsi_kolos_session_destroy(wsi_wl_surface->kolos_session);
 
    if (wsi_wl_surface->wl_syncobj_surface)
       wp_linux_drm_syncobj_surface_v1_destroy(wsi_wl_surface->wl_syncobj_surface);
@@ -1778,7 +2132,20 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
       goto fail;
    }
    wl_proxy_set_queue((struct wl_proxy *) wsi_wl_surface->surface,
-                      wsi_wl_surface->display->queue);
+                       wsi_wl_surface->display->queue);
+
+   if (wsi_wl_surface->display->kolos_graphics) {
+      wsi_wl_surface->kolos_surface = kolos_graphics_v1_get_surface(
+         wsi_wl_surface->display->kolos_graphics,
+         wsi_wl_surface->surface);
+      if (!wsi_wl_surface->kolos_surface) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail;
+      }
+      kolos_surface_v1_add_listener(wsi_wl_surface->kolos_surface,
+                                    &kolos_listener, wsi_wl_surface);
+      return VK_SUCCESS;
+   }
 
    /* Bind wsi_wl_surface to dma-buf feedback. */
    if (wsi_wl_surface->display->wl_dmabuf &&
@@ -1805,12 +2172,18 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
 
    return VK_SUCCESS;
 
-fail:
+ fail:
+   if (wsi_wl_surface->kolos_surface) {
+      kolos_surface_v1_destroy(wsi_wl_surface->kolos_surface);
+      wsi_wl_surface->kolos_surface = NULL;
+   }
    if (wsi_wl_surface->surface)
       wl_proxy_wrapper_destroy(wsi_wl_surface->surface);
+   wsi_wl_surface->surface = NULL;
 
    if (wsi_wl_surface->display)
       wsi_wl_display_destroy(wsi_wl_surface->display);
+   wsi_wl_surface->display = NULL;
    return result;
 }
 
@@ -2872,6 +3245,270 @@ wsi_wl_swapchain_destroy(struct wsi_swapchain *wsi_chain,
    return VK_SUCCESS;
 }
 
+struct wsi_wl_kolos_swapchain {
+   struct wsi_swapchain base;
+   struct wsi_wl_surface *surface;
+   struct wsi_kolos_pool *pool;
+   struct wsi_kolos_pool_info info;
+   bool retired;
+};
+
+static struct wsi_image *
+kolos_get_wsi_image(struct wsi_swapchain *base, uint32_t index)
+{
+   struct wsi_wl_kolos_swapchain *chain = (void *)base;
+   const struct wsi_kolos_image *image =
+      wsi_kolos_pool_get_image(chain->pool, index);
+   return image ? (struct wsi_image *)&image->base : NULL;
+}
+
+static VkResult
+kolos_release_images(struct wsi_swapchain *base, uint32_t count,
+                     const uint32_t *indices)
+{
+   struct wsi_wl_kolos_swapchain *chain = (void *)base;
+   for (uint32_t i = 0; i < count; i++) {
+      const struct wsi_kolos_image *image =
+         wsi_kolos_pool_get_image(chain->pool, indices[i]);
+      if (!image)
+         return VK_ERROR_INITIALIZATION_FAILED;
+      wsi_kolos_release_image(chain->surface->kolos_session,
+                              (struct wsi_kolos_image *)image);
+   }
+   return VK_SUCCESS;
+}
+
+static VkResult
+kolos_acquire_next_image(struct wsi_swapchain *base,
+                         const VkAcquireNextImageInfoKHR *info,
+                         uint32_t *image_index)
+{
+   struct wsi_wl_kolos_swapchain *chain = (void *)base;
+   struct wsi_wl_surface *surface = chain->surface;
+   if (chain->retired ||
+       chain->info.generation != surface->kolos_info.generation)
+      return VK_ERROR_OUT_OF_DATE_KHR;
+   struct timespec now, duration, deadline;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   timespec_from_nsec(&duration, info->timeout);
+   timespec_add(&deadline, &duration, &now);
+   for (;;) {
+      if (wl_display_dispatch_queue_pending(surface->display->wl_display,
+                                            surface->display->queue) < 0)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      if (surface->kolos_error != VK_SUCCESS)
+         return surface->kolos_error;
+      if (chain->retired ||
+          chain->info.generation != surface->kolos_info.generation)
+         return VK_ERROR_OUT_OF_DATE_KHR;
+      struct wsi_kolos_image *image;
+      VkResult result = wsi_kolos_pool_try_acquire(chain->pool, &image);
+      if (result == VK_SUCCESS) {
+         *image_index = image->id.slot;
+         return VK_SUCCESS;
+      }
+      if (result != VK_NOT_READY)
+         return result;
+      if (info->timeout == 0)
+         return VK_NOT_READY;
+      if (wl_display_flush(surface->display->wl_display) < 0 &&
+          errno != EAGAIN)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      int dispatched = loader_wayland_dispatch(surface->display->wl_display,
+                                                surface->display->queue,
+                                                info->timeout == UINT64_MAX ?
+                                                NULL : &deadline);
+      if (dispatched < 0)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      if (dispatched == 0)
+         return VK_TIMEOUT;
+   }
+}
+
+static VkResult
+kolos_queue_present(struct wsi_swapchain *base, uint32_t image_index,
+                    uint64_t present_id, const VkPresentRegionKHR *damage)
+{
+   struct wsi_wl_kolos_swapchain *chain = (void *)base;
+   struct wsi_wl_surface *surface = chain->surface;
+   /* Common WSI waited for its present submit fence before this callback. */
+   const struct wsi_kolos_image *image =
+      wsi_kolos_pool_get_image(chain->pool, image_index);
+   if (!image)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   if (chain->retired ||
+       chain->info.generation != surface->kolos_info.generation) {
+      wsi_kolos_release_image(surface->kolos_session,
+                              (struct wsi_kolos_image *)image);
+      return VK_ERROR_OUT_OF_DATE_KHR;
+   }
+   VkResult result = wsi_kolos_pool_presented(surface->kolos_session,
+                                     (struct wsi_kolos_image *)image,
+                                     surface->kolos_next_serial);
+   if (result != VK_SUCCESS)
+      return result;
+   surface->kolos_next_serial++;
+   if (wl_display_flush(surface->display->wl_display) < 0 && errno != EAGAIN) {
+      kolos_fail(surface, VK_ERROR_SURFACE_LOST_KHR);
+      return VK_ERROR_SURFACE_LOST_KHR;
+   }
+   /* kolos_surface_v1.present is the content commit.  No wl_buffer attach or
+    * wl_surface.commit is sent for this AHB frame. */
+   return VK_SUCCESS;
+}
+
+static VkResult
+kolos_swapchain_destroy(struct wsi_swapchain *base,
+                        const VkAllocationCallbacks *alloc)
+{
+   struct wsi_wl_kolos_swapchain *chain = (void *)base;
+   if (chain->surface->kolos_chain == chain)
+      chain->surface->kolos_chain = NULL;
+   wsi_kolos_unpin_pool(chain->pool);
+   wsi_swapchain_finish(base);
+   vk_free(alloc, chain);
+   return VK_SUCCESS;
+}
+
+static VkResult
+kolos_wait_for_import(struct wsi_wl_surface *surface,
+                      struct wsi_kolos_pool **out)
+{
+   struct timespec now, duration = { .tv_sec = 30 }, deadline;
+   clock_gettime(CLOCK_MONOTONIC, &now);
+   timespec_add(&deadline, &duration, &now);
+   for (;;) {
+      if (surface->kolos_error != VK_SUCCESS)
+         return surface->kolos_error;
+      struct wsi_kolos_pool *pool;
+      if (wsi_kolos_pin_current_pool(surface->kolos_session, &pool) ==
+          VK_SUCCESS) {
+         if (wsi_kolos_pool_get_info(pool).generation ==
+             surface->kolos_info.generation) {
+            *out = pool;
+            return VK_SUCCESS;
+         }
+         wsi_kolos_unpin_pool(pool);
+      }
+      if (wl_display_flush(surface->display->wl_display) < 0 &&
+          errno != EAGAIN)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      int dispatched = loader_wayland_dispatch(surface->display->wl_display,
+                                                surface->display->queue,
+                                                &deadline);
+      if (dispatched < 0)
+         return VK_ERROR_SURFACE_LOST_KHR;
+      if (dispatched == 0)
+         return VK_ERROR_INITIALIZATION_FAILED;
+   }
+}
+
+static VkResult
+kolos_create_swapchain(struct wsi_wl_surface *surface, VkDevice device,
+                       struct wsi_device *wsi_device,
+                       const VkSwapchainCreateInfoKHR *info,
+                       const VkAllocationCallbacks *alloc,
+                       struct wsi_swapchain **out)
+{
+   struct wsi_wl_kolos_swapchain *old = NULL;
+   if (info->oldSwapchain) {
+      VK_FROM_HANDLE(wsi_swapchain, old_base, info->oldSwapchain);
+      if (old_base->queue_present != kolos_queue_present)
+         return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+      old = (void *)old_base;
+      if (old->surface != surface)
+         return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+      old->retired = true;
+   }
+   if (surface->kolos_chain && surface->kolos_chain != old)
+      return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
+   VkResult result = kolos_wait_for_info(surface);
+   if (result != VK_SUCCESS)
+      return result;
+   const struct wsi_kolos_pool_info *pool_info = &surface->kolos_info;
+   if (info->imageExtent.width != pool_info->width ||
+       info->imageExtent.height != pool_info->height)
+      return VK_ERROR_OUT_OF_DATE_KHR;
+   if (wsi_device->sw || info->flags ||
+       info->imageFormat != VK_FORMAT_R8G8B8A8_UNORM ||
+       info->imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR ||
+       info->presentMode != VK_PRESENT_MODE_FIFO_KHR ||
+       info->minImageCount > pool_info->slot_count ||
+       info->imageArrayLayers != 1 ||
+       info->imageSharingMode != VK_SHARING_MODE_EXCLUSIVE ||
+       info->preTransform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ||
+       info->compositeAlpha != VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR ||
+       !info->imageUsage ||
+       (info->imageUsage & ~(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT)))
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+   if (!surface->kolos_session) {
+      result = wsi_kolos_session_create(wsi_device, device,
+                                         wsi_device->GetMemoryFdPropertiesKHR,
+                                         info->imageUsage,
+                                         alloc, pool_info->session_id,
+                                         &kolos_transport, surface,
+                                         &surface->kolos_session);
+      if (result != VK_SUCCESS)
+         return result;
+      surface->kolos_device = device;
+      surface->kolos_usage = info->imageUsage;
+      result = wsi_kolos_pool_create(surface->kolos_session,
+                                      pool_info->generation,
+                                      pool_info->width, pool_info->height,
+                                      pool_info->format,
+                                      pool_info->slot_count,
+                                      &surface->kolos_staging);
+      if (result == VK_SUCCESS)
+         result = wsi_kolos_pool_request_buffers(surface->kolos_staging);
+      if (result != VK_SUCCESS)
+         return result;
+   } else if (surface->kolos_device != device ||
+              surface->kolos_usage != info->imageUsage) {
+      return VK_ERROR_INITIALIZATION_FAILED;
+   }
+
+   struct wsi_kolos_pool *pool = NULL;
+   result = kolos_wait_for_import(surface, &pool);
+   if (result != VK_SUCCESS)
+      return result;
+   struct wsi_wl_kolos_swapchain *chain =
+      vk_zalloc(alloc, sizeof(*chain), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!chain) {
+      wsi_kolos_unpin_pool(pool);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   vk_object_base_init(vk_device_from_handle(device), &chain->base.base,
+                       VK_OBJECT_TYPE_SWAPCHAIN_KHR);
+   chain->base.wsi = wsi_device;
+   chain->base.device = device;
+   chain->base.alloc = *alloc;
+   chain->base.image_count = pool_info->slot_count;
+   chain->base.cpu_wait_for_present = true;
+   chain->base.present_mode = VK_PRESENT_MODE_FIFO_KHR;
+   chain->base.destroy = kolos_swapchain_destroy;
+   chain->base.get_wsi_image = kolos_get_wsi_image;
+   chain->base.acquire_next_image = kolos_acquire_next_image;
+   chain->base.queue_present = kolos_queue_present;
+   chain->base.release_images = kolos_release_images;
+   chain->base.cmd_pools = vk_zalloc(alloc,
+      sizeof(VkCommandPool) * wsi_device->queue_family_count, 8,
+      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   if (!chain->base.cmd_pools) {
+      wsi_kolos_unpin_pool(pool);
+      vk_object_base_finish(&chain->base.base);
+      vk_free(alloc, chain);
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   }
+   chain->surface = surface;
+   chain->pool = pool;
+   chain->info = wsi_kolos_pool_get_info(pool);
+   surface->kolos_chain = chain;
+   *out = &chain->base;
+   return VK_SUCCESS;
+}
+
 static VkResult
 wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
                                 VkDevice device,
@@ -2886,6 +3523,15 @@ wsi_wl_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    VkResult result;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR);
+
+   bool is_kolos;
+   VkResult kolos_result = wsi_wl_check_kolos(icd_surface, wsi_device,
+                                               &is_kolos);
+   if (kolos_result != VK_SUCCESS)
+      return kolos_result;
+   if (is_kolos)
+      return kolos_create_swapchain(wsi_wl_surface, device, wsi_device,
+                                    pCreateInfo, pAllocator, swapchain_out);
 
    /* From spec 1.3.278:
     * Upon calling vkCreateSwapchainKHR with an oldSwapchain that is not VK_NULL_HANDLE,

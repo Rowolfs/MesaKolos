@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: MIT
  *
  * No Unix socket, Android wire opcode or wl_surface belongs in this file.
- * The private Wayland backend will supply buffer metadata and events.
+ * The private Wayland backend supplies buffer metadata and events.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE 1
@@ -698,6 +698,36 @@ wsi_kolos_pool_acquire(struct wsi_kolos_session *session, uint64_t timeout_ns,
       }
    }
 out:
+   pthread_mutex_unlock(&session->lock);
+   return result;
+}
+
+VkResult
+wsi_kolos_pool_try_acquire(struct wsi_kolos_pool *pool,
+                           struct wsi_kolos_image **out)
+{
+   if (!pool || !out)
+      return VK_ERROR_INITIALIZATION_FAILED;
+   *out = NULL;
+   struct wsi_kolos_session *session = pool->session;
+   pthread_mutex_lock(&session->lock);
+   VkResult result = session->error;
+   if (result == VK_SUCCESS && session->destroying)
+      result = VK_ERROR_SURFACE_LOST_KHR;
+   if (result == VK_SUCCESS && pool != session->current)
+      result = VK_ERROR_OUT_OF_DATE_KHR;
+   if (result == VK_SUCCESS) {
+      result = VK_NOT_READY;
+      for (uint32_t i = 0; i < pool->info.slot_count; i++) {
+         if (pool->state[i] == KOLOS_AVAILABLE) {
+            pool->state[i] = KOLOS_ACQUIRED;
+            pool->leases++;
+            *out = &pool->images[i];
+            result = VK_SUCCESS;
+            break;
+         }
+      }
+   }
    pthread_mutex_unlock(&session->lock);
    return result;
 }

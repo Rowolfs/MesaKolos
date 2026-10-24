@@ -1,8 +1,8 @@
 /* Copyright © 2026 Kolos contributors
  * SPDX-License-Identifier: MIT
  *
- * Transport-neutral Kolos WSI import/lifecycle core.  A future private
- * Wayland backend owns wl_surface routing and delivers pool/buffer events.
+ * Transport-neutral Kolos WSI import/lifecycle core.  The private Wayland
+ * backend owns wl_surface routing and delivers pool/buffer events.
  */
 #ifndef WSI_COMMON_KOLOS_H
 #define WSI_COMMON_KOLOS_H
@@ -41,7 +41,7 @@ struct wsi_kolos_image {
    uint64_t modifier, offset, row_pitch, allocation_size;
 };
 
-/* These outbound operations are implemented by the future private Wayland
+/* These outbound operations are implemented by the private Wayland
  * transport.  No Android graphics.sock connection belongs in production WSI.
  * Callbacks must not synchronously re-enter this session's event API.
  */
@@ -106,6 +106,11 @@ void wsi_kolos_session_error(struct wsi_kolos_session *session, VkResult error);
 VkResult
 wsi_kolos_pool_acquire(struct wsi_kolos_session *session, uint64_t timeout_ns,
                        struct wsi_kolos_image **out);
+/* Wayland WSI dispatches its own event queue; this never waits on a condvar
+ * and only acquires an image from the swapchain's pinned generation. */
+VkResult
+wsi_kolos_pool_try_acquire(struct wsi_kolos_pool *pool,
+                           struct wsi_kolos_image **out);
 VkResult
 wsi_kolos_pool_presented(struct wsi_kolos_session *session,
                          struct wsi_kolos_image *image, uint64_t serial);
