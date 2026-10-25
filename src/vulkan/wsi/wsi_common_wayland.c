@@ -196,6 +196,7 @@ struct wsi_wl_surface {
    VkImageUsageFlags kolos_usage;
    uint64_t kolos_next_serial;
    struct wsi_wl_kolos_swapchain *kolos_chain;
+   uint32_t kolos_chain_count;
 };
 
 struct wsi_wl_swapchain {
@@ -1817,6 +1818,25 @@ static const struct kolos_surface_v1_listener kolos_listener = {
    kolos_free, kolos_ack, kolos_error,
 };
 
+static void
+kolos_close_graphics(struct wsi_wl_surface *surface)
+{
+   if (surface->kolos_session)
+      wsi_kolos_session_destroy(surface->kolos_session);
+   surface->kolos_session = NULL;
+   surface->kolos_staging = NULL;
+   surface->kolos_device = VK_NULL_HANDLE;
+   surface->kolos_usage = 0;
+   surface->kolos_imported = 0;
+   surface->kolos_info = (struct wsi_kolos_pool_info){0};
+   surface->kolos_error = VK_SUCCESS;
+   surface->kolos_next_serial = 0;
+   if (surface->kolos_surface) {
+      kolos_surface_v1_destroy(surface->kolos_surface);
+      surface->kolos_surface = NULL;
+   }
+}
+
 static VkResult
 kolos_wait_for_info(struct wsi_wl_surface *surface)
 {
@@ -1855,10 +1875,7 @@ wsi_wl_surface_destroy(VkIcdSurfaceBase *icd_surface, VkInstance _instance,
    struct wsi_wl_surface *wsi_wl_surface =
       wl_container_of((VkIcdSurfaceWayland *)icd_surface, wsi_wl_surface, base);
 
-   if (wsi_wl_surface->kolos_surface)
-      kolos_surface_v1_destroy(wsi_wl_surface->kolos_surface);
-   if (wsi_wl_surface->kolos_session)
-      wsi_kolos_session_destroy(wsi_wl_surface->kolos_session);
+   kolos_close_graphics(wsi_wl_surface);
 
    if (wsi_wl_surface->wl_syncobj_surface)
       wp_linux_drm_syncobj_surface_v1_destroy(wsi_wl_surface->wl_syncobj_surface);
@@ -2109,6 +2126,18 @@ wsi_wl_surface_analytics_init(struct wsi_wl_surface *wsi_wl_surface,
                   "wl%" PRIu64 " latency", wl_id);
 }
 
+static VkResult
+wsi_wl_surface_init_kolos(struct wsi_wl_surface *surface)
+{
+   surface->kolos_surface = kolos_graphics_v1_get_surface(
+      surface->display->kolos_graphics, surface->surface);
+   if (!surface->kolos_surface)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+   kolos_surface_v1_add_listener(surface->kolos_surface,
+                                 &kolos_listener, surface);
+   return VK_SUCCESS;
+}
+
 static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
                                     struct wsi_device *wsi_device,
                                     const VkAllocationCallbacks *pAllocator)
@@ -2119,7 +2148,9 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
 
    /* wsi_wl_surface has already been initialized. */
    if (wsi_wl_surface->display)
-      return VK_SUCCESS;
+      return wsi_wl_surface->display->kolos_graphics &&
+             !wsi_wl_surface->kolos_surface
+         ? wsi_wl_surface_init_kolos(wsi_wl_surface) : VK_SUCCESS;
 
    result = wsi_wl_display_create(wsi, wsi_wl_surface->base.display,
                                   wsi_device->sw, &wsi_wl_surface->display);
@@ -2135,15 +2166,9 @@ static VkResult wsi_wl_surface_init(struct wsi_wl_surface *wsi_wl_surface,
                        wsi_wl_surface->display->queue);
 
    if (wsi_wl_surface->display->kolos_graphics) {
-      wsi_wl_surface->kolos_surface = kolos_graphics_v1_get_surface(
-         wsi_wl_surface->display->kolos_graphics,
-         wsi_wl_surface->surface);
-      if (!wsi_wl_surface->kolos_surface) {
-         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      result = wsi_wl_surface_init_kolos(wsi_wl_surface);
+      if (result != VK_SUCCESS)
          goto fail;
-      }
-      kolos_surface_v1_add_listener(wsi_wl_surface->kolos_surface,
-                                    &kolos_listener, wsi_wl_surface);
       return VK_SUCCESS;
    }
 
@@ -3362,10 +3387,14 @@ kolos_swapchain_destroy(struct wsi_swapchain *base,
                         const VkAllocationCallbacks *alloc)
 {
    struct wsi_wl_kolos_swapchain *chain = (void *)base;
-   if (chain->surface->kolos_chain == chain)
-      chain->surface->kolos_chain = NULL;
+   struct wsi_wl_surface *surface = chain->surface;
+   if (surface->kolos_chain == chain)
+      surface->kolos_chain = NULL;
    wsi_kolos_unpin_pool(chain->pool);
    wsi_swapchain_finish(base);
+   assert(surface->kolos_chain_count > 0);
+   if (--surface->kolos_chain_count == 0)
+      kolos_close_graphics(surface);
    vk_free(alloc, chain);
    return VK_SUCCESS;
 }
@@ -3462,8 +3491,11 @@ kolos_create_swapchain(struct wsi_wl_surface *surface, VkDevice device,
                                       &surface->kolos_staging);
       if (result == VK_SUCCESS)
          result = wsi_kolos_pool_request_buffers(surface->kolos_staging);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         if (!surface->kolos_chain_count)
+            kolos_close_graphics(surface);
          return result;
+      }
    } else if (surface->kolos_device != device ||
               surface->kolos_usage != info->imageUsage) {
       return VK_ERROR_INITIALIZATION_FAILED;
@@ -3471,12 +3503,17 @@ kolos_create_swapchain(struct wsi_wl_surface *surface, VkDevice device,
 
    struct wsi_kolos_pool *pool = NULL;
    result = kolos_wait_for_import(surface, &pool);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      if (!surface->kolos_chain_count)
+         kolos_close_graphics(surface);
       return result;
+   }
    struct wsi_wl_kolos_swapchain *chain =
       vk_zalloc(alloc, sizeof(*chain), 8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!chain) {
       wsi_kolos_unpin_pool(pool);
+      if (!surface->kolos_chain_count)
+         kolos_close_graphics(surface);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    vk_object_base_init(vk_device_from_handle(device), &chain->base.base,
@@ -3499,12 +3536,15 @@ kolos_create_swapchain(struct wsi_wl_surface *surface, VkDevice device,
       wsi_kolos_unpin_pool(pool);
       vk_object_base_finish(&chain->base.base);
       vk_free(alloc, chain);
+      if (!surface->kolos_chain_count)
+         kolos_close_graphics(surface);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
    chain->surface = surface;
    chain->pool = pool;
    chain->info = wsi_kolos_pool_get_info(pool);
    surface->kolos_chain = chain;
+   surface->kolos_chain_count++;
    *out = &chain->base;
    return VK_SUCCESS;
 }
