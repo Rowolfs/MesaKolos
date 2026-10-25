@@ -569,6 +569,13 @@ wsi_swapchain_finish(struct wsi_swapchain *chain)
 
       vk_free(&chain->alloc, chain->blit.semaphores);
    }
+   if (chain->external_present_semaphores) {
+      for (unsigned i = 0; i < chain->image_count; i++)
+         chain->wsi->DestroySemaphore(chain->device,
+                                     chain->external_present_semaphores[i],
+                                     &chain->alloc);
+      vk_free(&chain->alloc, chain->external_present_semaphores);
+   }
    chain->wsi->DestroySemaphore(chain->device, chain->dma_buf_semaphore,
                                 &chain->alloc);
    chain->wsi->DestroySemaphore(chain->device, chain->present_id_timeline,
@@ -1492,7 +1499,12 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       struct wsi_memory_signal_submit_info mem_signal;
       bool has_signal_dma_buf = false;
       bool explicit_sync = swapchain->image_info.explicit_sync;
-      if (explicit_sync) {
+      if (swapchain->external_present_semaphores) {
+         assert(submit_info.signalSemaphoreCount == 0);
+         submit_info.signalSemaphoreCount = 1;
+         submit_info.pSignalSemaphores =
+            &swapchain->external_present_semaphores[image_index];
+      } else if (explicit_sync) {
          /* We will signal this acquire value ourselves when GPU work is done. */
          image->explicit_sync[WSI_ES_ACQUIRE].timeline++;
          /* The compositor will signal this value when it is done with the image. */

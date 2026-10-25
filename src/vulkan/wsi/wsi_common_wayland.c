@@ -931,7 +931,8 @@ registry_handle_global(void *data, struct wl_registry *registry,
    if (strcmp(interface, kolos_graphics_v1_interface.name) == 0 &&
        !display->kolos_graphics)
       display->kolos_graphics = wl_registry_bind(registry, name,
-                                                 &kolos_graphics_v1_interface, 1);
+                                                 &kolos_graphics_v1_interface,
+                                                 MIN2(version, 2));
 
    if (display->sw) {
       if (strcmp(interface, wl_shm_interface.name) == 0) {
@@ -1639,12 +1640,20 @@ kolos_pool_ready(void *data, uint64_t session_id, uint64_t generation)
 }
 
 static VkResult
-kolos_present(void *data, struct wsi_kolos_identity id, uint64_t serial)
+kolos_present(void *data, struct wsi_kolos_identity id, uint64_t serial,
+              int acquire_fence_fd)
 {
    struct wsi_wl_surface *surface = data;
-   kolos_surface_v1_present(surface->kolos_surface,
-                            id.generation >> 32, id.generation, id.slot,
-                            serial >> 32, serial);
+   if (acquire_fence_fd >= 0) {
+      kolos_surface_v1_present_fenced(surface->kolos_surface,
+                                     id.generation >> 32, id.generation,
+                                     id.slot, serial >> 32, serial,
+                                     acquire_fence_fd);
+   } else {
+      kolos_surface_v1_present(surface->kolos_surface,
+                               id.generation >> 32, id.generation, id.slot,
+                               serial >> 32, serial);
+   }
    return VK_SUCCESS;
 }
 
@@ -3356,7 +3365,8 @@ kolos_queue_present(struct wsi_swapchain *base, uint32_t image_index,
 {
    struct wsi_wl_kolos_swapchain *chain = (void *)base;
    struct wsi_wl_surface *surface = chain->surface;
-   /* Common WSI waited for its present submit fence before this callback. */
+   /* The exported sync_fd carries GPU completion to SurfaceControl. Legacy
+    * protocol peers still use the common WSI CPU wait before this callback. */
    const struct wsi_kolos_image *image =
       wsi_kolos_pool_get_image(chain->pool, image_index);
    if (!image)
@@ -3367,9 +3377,24 @@ kolos_queue_present(struct wsi_swapchain *base, uint32_t image_index,
                               (struct wsi_kolos_image *)image);
       return VK_ERROR_OUT_OF_DATE_KHR;
    }
+   int acquire_fd = -1;
+   if (base->external_present_semaphores) {
+      const VkSemaphoreGetFdInfoKHR fd_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
+         .semaphore = base->external_present_semaphores[image_index],
+         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+      };
+      VkResult exported = base->wsi->GetSemaphoreFdKHR(base->device,
+                                                        &fd_info, &acquire_fd);
+      if (exported != VK_SUCCESS)
+         return exported;
+      /* Vulkan may return -1 when the sync_fd payload already signaled. */
+   }
    VkResult result = wsi_kolos_pool_presented(surface->kolos_session,
-                                     (struct wsi_kolos_image *)image,
-                                     surface->kolos_next_serial);
+                                      (struct wsi_kolos_image *)image,
+                                      surface->kolos_next_serial, acquire_fd);
+   if (acquire_fd >= 0)
+      close(acquire_fd);
    if (result != VK_SUCCESS)
       return result;
    surface->kolos_next_serial++;
@@ -3540,6 +3565,37 @@ kolos_create_swapchain(struct wsi_wl_surface *surface, VkDevice device,
          kolos_close_graphics(surface);
       return VK_ERROR_OUT_OF_HOST_MEMORY;
    }
+   if (surface->kolos_surface &&
+       kolos_surface_v1_get_version(surface->kolos_surface) >= 2 &&
+       (wsi_device->semaphore_export_handle_types &
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT)) {
+      chain->base.external_present_semaphores = vk_zalloc(alloc,
+         sizeof(VkSemaphore) * chain->base.image_count, 8,
+         VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+      if (!chain->base.external_present_semaphores) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail_sync;
+      }
+      const VkExportSemaphoreCreateInfo export_info = {
+         .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+         .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+      };
+      const VkSemaphoreCreateInfo semaphore_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+         .pNext = &export_info,
+      };
+      for (uint32_t i = 0; i < chain->base.image_count; i++) {
+         result = wsi_device->CreateSemaphore(device, &semaphore_info, alloc,
+                    &chain->base.external_present_semaphores[i]);
+         if (result != VK_SUCCESS)
+            goto fail_sync;
+      }
+      chain->base.cpu_wait_for_present = false;
+      fprintf(stderr, "MesaKolos: GPU acquire fences enabled for generation=%" PRIu64 "\n",
+              pool_info->generation);
+   } else {
+      fprintf(stderr, "MesaKolos: GPU acquire fence unavailable; using CPU wait\n");
+   }
    chain->surface = surface;
    chain->pool = pool;
    chain->info = wsi_kolos_pool_get_info(pool);
@@ -3547,6 +3603,21 @@ kolos_create_swapchain(struct wsi_wl_surface *surface, VkDevice device,
    surface->kolos_chain_count++;
    *out = &chain->base;
    return VK_SUCCESS;
+fail_sync:
+   if (chain->base.external_present_semaphores) {
+      for (uint32_t i = 0; i < chain->base.image_count; i++)
+         if (chain->base.external_present_semaphores[i])
+            wsi_device->DestroySemaphore(device,
+                 chain->base.external_present_semaphores[i], alloc);
+      vk_free(alloc, chain->base.external_present_semaphores);
+   }
+   vk_free(alloc, chain->base.cmd_pools);
+   wsi_kolos_unpin_pool(pool);
+   vk_object_base_finish(&chain->base.base);
+   vk_free(alloc, chain);
+   if (!surface->kolos_chain_count)
+      kolos_close_graphics(surface);
+   return result;
 }
 
 static VkResult

@@ -2,7 +2,7 @@
 <!-- Kolos private Wayland protocol v1. Canonical source:
      KolosLinux/protocol/kolos-graphics-v1.xml. Keep definitions in sync. -->
 <protocol name="kolos_graphics_v1">
-  <interface name="kolos_graphics_v1" version="1">
+  <interface name="kolos_graphics_v1" version="2">
     <description summary="Kolos graphics transport for a Wayland surface">
       Only the compositor maps a wl_surface to an Android session. The client
       never supplies a session id. All 64-bit values are high/low uint pairs.
@@ -13,7 +13,7 @@
       <arg name="surface" type="object" interface="wl_surface"/>
     </request>
   </interface>
-  <interface name="kolos_surface_v1" version="1">
+  <interface name="kolos_surface_v1" version="2">
     <description summary="graphics pool attached to one xdg_toplevel">
       BUFFER FDs are borrowed dma-buf/native-handle FDs. The native-handle
       byte array is the observed Android handle data; clients must validate
@@ -35,6 +35,14 @@
       <arg name="slot" type="uint"/>
       <arg name="serial_hi" type="uint"/>
       <arg name="serial_lo" type="uint"/>
+    </request>
+    <request name="present_fenced" since="2">
+      <arg name="generation_hi" type="uint"/>
+      <arg name="generation_lo" type="uint"/>
+      <arg name="slot" type="uint"/>
+      <arg name="serial_hi" type="uint"/>
+      <arg name="serial_lo" type="uint"/>
+      <arg name="acquire_fence" type="fd"/>
     </request>
     <event name="new_pool">
       <arg name="session_hi" type="uint"/>

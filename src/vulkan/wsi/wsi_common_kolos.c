@@ -734,7 +734,8 @@ wsi_kolos_pool_try_acquire(struct wsi_kolos_pool *pool,
 
 VkResult
 wsi_kolos_pool_presented(struct wsi_kolos_session *session,
-                         struct wsi_kolos_image *image, uint64_t serial)
+                          struct wsi_kolos_image *image, uint64_t serial,
+                          int acquire_fence_fd)
 {
    if (!session || !image)
       return VK_ERROR_INITIALIZATION_FAILED;
@@ -764,7 +765,7 @@ wsi_kolos_pool_presented(struct wsi_kolos_session *session,
    /* The callback only enqueues a transport message.  It must not wait for
     * FREE or synchronously dispatch back into this session. */
    VkResult result = session->transport.present(
-      session->transport_data, image->id, serial);
+       session->transport_data, image->id, serial, acquire_fence_fd);
    pool->state[image->id.slot] = KOLOS_PRESENTED;
    pool->leases--;
    if (result == VK_SUCCESS)

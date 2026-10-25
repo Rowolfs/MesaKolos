@@ -176,6 +176,9 @@ struct wsi_swapchain {
    VkDevice device;
    VkAllocationCallbacks alloc;
    VkFence* fences;
+   /* Kolos: one reusable binary semaphore per image, exported as sync_fd
+    * after the present submit and passed to Android SurfaceControl. */
+   VkSemaphore *external_present_semaphores;
    VkPresentModeKHR present_mode;
    VkSemaphore present_id_timeline;
 
@@ -185,8 +188,8 @@ struct wsi_swapchain {
    struct wsi_image_info image_info;
    uint32_t image_count;
 
-   /* Platform handoff uses the common present submission's CPU fence rather
-    * than dma-buf implicit/explicit sync signaling. */
+   /* Legacy Kolos peers use a CPU wait. Protocol v2 peers receive a sync_fd
+    * from external_present_semaphores instead. */
    bool cpu_wait_for_present;
 
    uint64_t present_serial;

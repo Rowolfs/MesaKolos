@@ -50,7 +50,7 @@ struct wsi_kolos_transport_ops {
    VkResult (*pool_ready)(void *data, uint64_t session_id,
                           uint64_t generation);
    VkResult (*present)(void *data, struct wsi_kolos_identity id,
-                       uint64_t serial);
+                       uint64_t serial, int acquire_fence_fd);
 };
 
 VkResult
@@ -100,8 +100,8 @@ void wsi_kolos_session_error(struct wsi_kolos_session *session, VkResult error);
 
 /* Blocking acquire uses a condition variable; zero timeout returns NOT_READY.
  * The image lease lasts until present or release_image.  Transport owns the
- * queue/ownership synchronization before calling present; no rendering layout
- * is imposed by this core.
+ * queue/ownership synchronization before calling present; a sync_fd may be
+ * forwarded by the transport. No rendering layout is imposed by this core.
  */
 VkResult
 wsi_kolos_pool_acquire(struct wsi_kolos_session *session, uint64_t timeout_ns,
@@ -113,7 +113,8 @@ wsi_kolos_pool_try_acquire(struct wsi_kolos_pool *pool,
                            struct wsi_kolos_image **out);
 VkResult
 wsi_kolos_pool_presented(struct wsi_kolos_session *session,
-                         struct wsi_kolos_image *image, uint64_t serial);
+                         struct wsi_kolos_image *image, uint64_t serial,
+                         int acquire_fence_fd);
 void wsi_kolos_release_image(struct wsi_kolos_session *session,
                              struct wsi_kolos_image *image);
 
