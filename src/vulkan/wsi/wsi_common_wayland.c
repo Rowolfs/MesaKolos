@@ -43,6 +43,7 @@
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
 #include "wsi_common_kolos.h"
+#include "wsi_common_kolos_trace.h"
 #include "wsi_common_kolos_qualcomm.h"
 #include "kolos-graphics-v1-client-protocol.h"
 #include "fifo-v1-client-protocol.h"
@@ -1801,6 +1802,8 @@ kolos_free(void *data, struct kolos_surface_v1 *proxy,
          kolos_join(generation_hi, generation_lo), slot,
       };
       /* A retired generation may already have been collected. */
+      wsi_kolos_trace("FREE_RX", id.session_id, id.generation,
+                      id.slot, -1, -1);
       wsi_kolos_pool_set_available(surface->kolos_session, id);
    }
 }
@@ -3390,9 +3393,13 @@ kolos_queue_present(struct wsi_swapchain *base, uint32_t image_index,
          return exported;
       /* Vulkan may return -1 when the sync_fd payload already signaled. */
    }
+   wsi_kolos_trace(base->external_present_semaphores ? "GPU_FENCE_EXPORT" :
+                   "CPU_WAIT_DONE", image->id.session_id,
+                   image->id.generation, image->id.slot,
+                   (int64_t)surface->kolos_next_serial, acquire_fd);
    VkResult result = wsi_kolos_pool_presented(surface->kolos_session,
-                                      (struct wsi_kolos_image *)image,
-                                      surface->kolos_next_serial, acquire_fd);
+                                             (struct wsi_kolos_image *)image,
+                                             surface->kolos_next_serial, acquire_fd);
    if (acquire_fd >= 0)
       close(acquire_fd);
    if (result != VK_SUCCESS)

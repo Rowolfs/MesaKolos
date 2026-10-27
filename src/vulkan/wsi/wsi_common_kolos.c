@@ -8,6 +8,7 @@
 #define _GNU_SOURCE 1
 #endif
 #include "wsi_common_kolos.h"
+#include "wsi_common_kolos_trace.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -615,6 +616,8 @@ wsi_kolos_pool_set_available(struct wsi_kolos_session *session,
       result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
    if (result == VK_SUCCESS) {
       pool->state[id.slot] = KOLOS_AVAILABLE;
+      wsi_kolos_trace("SLOT_AVAILABLE", id.session_id, id.generation,
+                      id.slot, -1, -1);
       collect_retired(session);
       pthread_cond_broadcast(&session->changed);
    }
@@ -723,6 +726,8 @@ wsi_kolos_pool_try_acquire(struct wsi_kolos_pool *pool,
             pool->state[i] = KOLOS_ACQUIRED;
             pool->leases++;
             *out = &pool->images[i];
+            wsi_kolos_trace("SLOT_ACQUIRED", session->id,
+                            pool->info.generation, i, -1, -1);
             result = VK_SUCCESS;
             break;
          }
@@ -767,6 +772,10 @@ wsi_kolos_pool_presented(struct wsi_kolos_session *session,
    VkResult result = session->transport.present(
        session->transport_data, image->id, serial, acquire_fence_fd);
    pool->state[image->id.slot] = KOLOS_PRESENTED;
+   if (result == VK_SUCCESS)
+      wsi_kolos_trace("SLOT_PRESENTED", image->id.session_id,
+                      image->id.generation, image->id.slot,
+                      (int64_t)serial, acquire_fence_fd);
    pool->leases--;
    if (result == VK_SUCCESS)
       session->next_serial++;
